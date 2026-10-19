@@ -84,7 +84,7 @@ class CLITest(unittest.TestCase):
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                 cli("prepare", "--dataset", root / "dataset.json", "--db-root", root, "--out", root / "split")
                 cli("probe", "--config", root / "config.json", "--out", root / "probe.json")
-                for arch in ["workflow"]:
+                for arch in ["workflow", "single"]:
                     cli("run", "--architecture", arch, "--config", root / "config.json", "--tasks", root / "split/pilot.tasks.json", "--db-root", root, "--out", root / arch)
                     cli("evaluate", "--tasks", root / "split/pilot.tasks.json", "--gold", root / "split/pilot.gold.json", "--run", root / arch, "--db-root", root, "--out", root / f"{arch}.report.json", "--rves-repeats", "2")
                     self.assertEqual(read_json(root / f"{arch}.report.json")["summary"]["EX_final"], 1)
@@ -101,13 +101,28 @@ class CLITest(unittest.TestCase):
                 config["token_accounting"] = {"mode": "usage", "prompt_margin_tokens": 512}
                 write_json(root / "usage_config.json", config)
                 cli("probe", "--config", root / "usage_config.json", "--out", root / "usage_probe.json")
-                for arch in ["workflow"]:
+                for arch in ["workflow", "single"]:
                     output = root / (arch + "_usage")
                     cli("run", "--architecture", arch, "--config", root / "usage_config.json", "--tasks", root / "split/pilot.tasks.json", "--db-root", root, "--out", output)
                     self.assertTrue(all(r["stop_reason"] == "submitted" for r in read_json(output / "results.json")))
                     summary = read_json(output / "resource_summary.json")
                     self.assertEqual(summary["known_tokens"], 370)
                     self.assertEqual(summary["tokenizer_mismatch_count"], 10)
+                MockHTTP.simulate_recovery = True
+                recovery = root / "single_recovery"
+                cli("run", "--architecture", "single", "--config", root / "usage_config.json", "--tasks", root / "split/pilot.tasks.json", "--db-root", root, "--out", recovery)
+                cli("evaluate", "--tasks", root / "split/pilot.tasks.json", "--gold", root / "split/pilot.gold.json", "--run", recovery, "--db-root", root, "--out", root / "recovery.report.json")
+                report = read_json(root / "recovery.report.json")
+                self.assertEqual(report["summary"]["EX_first"], 0)
+                self.assertEqual(report["summary"]["EX_final"], 1)
+                self.assertEqual(report["summary"]["repairs"], 10)
+                quality = report["investigation_quality"]
+                self.assertEqual(quality["coverage_episodes"], 10)
+                self.assertEqual(quality["episodes_recovering_submission_error"], 10)
+                self.assertEqual(quality["repairs_in_episodes_with_diagnostics"], 0)
+                resources = read_json(recovery / "resource_summary.json")
+                self.assertEqual(resources["known_tokens"], 740)
+                self.assertEqual(resources["investigation"]["failed_submissions"], 10)
                 # A malformed envelope still carries real usage through the whole CLI.
                 MockHTTP.malformed_content = True
                 malformed_probe = root / "malformed_probe.json"
@@ -118,7 +133,7 @@ class CLITest(unittest.TestCase):
                 self.assertEqual(case["error_kind"], "response_format")
                 self.assertEqual(case["diagnostics"]["http_status"], 200)
                 self.assertTrue(case["usage_complete"])
-                for arch in ["workflow"]:
+                for arch in ["workflow", "single"]:
                     malformed = root / (arch + "_malformed")
                     cli("run", "--architecture", arch, "--config", root / "usage_config.json", "--tasks", root / "split/pilot.tasks.json",
                         "--db-root", root, "--out", malformed)

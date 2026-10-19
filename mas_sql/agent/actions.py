@@ -94,4 +94,16 @@ class ActionParser:
             if name != "submit_sql" or set(value) != {"action", "sql"}:
                 raise ValueError("Workflow requires exactly action=submit_sql and sql")
             return Action("submit_sql", sql)
-        raise ValueError("Only workflow is integrated in this stage")
+        if architecture != "single":
+            raise ValueError("Unknown architecture")
+        revision: Revision | None = cls._revision(value["revision"]) if "revision" in value else None
+        if name == "submit_sql" and not set(value) - {"action", "sql", "revision"}:
+            return Action("submit_sql", sql, revision=revision)
+        if name == "execute_sql" and not set(value) - {"action", "sql", "purpose", "check", "revision"}:
+            purpose: object = value.get("purpose")
+            if purpose == "candidate" and "check" not in value:
+                return Action("execute_sql", sql, "candidate", revision=revision)
+            if purpose == "diagnostic" and revision is None:
+                check: str = cls._text(value.get("check"), "diagnostic check", 600)
+                return Action("execute_sql", sql, "diagnostic", check=check)
+        raise ValueError("Unknown action, purpose or unexpected fields")

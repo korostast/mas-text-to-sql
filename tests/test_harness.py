@@ -146,16 +146,91 @@ class RuntimeTests(DatabaseCase):
         self.assertNotIn("Alice", json.dumps(client.messages))
         self.assertNotIn("reasoning", json.dumps(client.messages))
 
+    def test_single_repairs_and_preserves_first(self) -> None:
+        """Verify single repairs and preserves first."""
+        client = FakeClient([candidate("SELECT unknown FROM missing"), candidate('SELECT name FROM "odd table"', {"reason": "Fix identifiers using the error and DDL", "sources": ["schema", "observation:1"]}), submit('SELECT name FROM "odd table"')])
+        result = solve(self.task, self.path, "single", client)
+        self.assertEqual(result["stop_reason"], "submitted")
+        self.assertEqual(result["first_sql"], "SELECT unknown FROM missing")
+        self.assertEqual(result["tool_calls"], 3)
+        self.assertIn("no such table", json.dumps(client.messages[1]))
+        self.assertEqual(result["usage"]["total_tokens"], 90)
 
+    def test_budget_unfinished_no_last_candidate_fallback(self) -> None:
+        """Verify budget unfinished no last candidate fallback."""
+        result = solve(self.task, self.path, "single", FakeClient([candidate("SELECT 1")]), Budget(max_llm_calls=1))
+        self.assertIsNone(result["final_sql"])
+        self.assertEqual(result["first_sql"], "SELECT 1")
+        self.assertEqual(result["stop_reason"], "llm_call_budget")
 
+    def test_final_is_checked_not_previous_candidate(self) -> None:
+        """Keep failed final attempts out of accepted single-agent answers."""
+        client = FakeClient([candidate("SELECT 1"), submit("SELECT missing FROM absent", {
+            "reason": "Use the requested relation", "sources": ["question"]})])
+        result = solve(self.task, self.path, "single", client, Budget(max_llm_calls=2))
+        self.assertEqual(result["stop_reason"], "llm_call_budget")
+        self.assertIsNone(result["final_sql"])
+        self.assertNotEqual(result["last_submission"]["result"]["status"], "ok")
+        self.assertFalse(result["submission_accepted"])
 
+    def test_diagnostic_not_first_candidate(self) -> None:
+        """Verify diagnostic not first candidate."""
+        diag = {"action": "execute_sql", "purpose": "diagnostic", "check": "Check the literal two", "sql": "SELECT 2"}
+        result = solve(self.task, self.path, "single", FakeClient([diag, candidate("SELECT 1"), diag, submit("SELECT 1")]))
+        self.assertEqual(result["first_sql"], "SELECT 1")
+        self.assertEqual(result["tool_calls"], 3)
+        self.assertEqual(result["llm_calls"], 4)
 
+    def test_last_tool_slot_reserved(self) -> None:
+        """Verify last tool slot reserved."""
+        result = solve(self.task, self.path, "single", FakeClient([candidate("SELECT 1"), candidate("SELECT 2", {"reason": "Use requested constant", "sources": ["question"]}), submit("SELECT 2", {"reason": "Use requested constant", "sources": ["question"]})]), Budget(max_tool_calls=2))
+        self.assertEqual(result["tool_calls"], 2)
+        self.assertEqual(result["stop_reason"], "submitted")
+        self.assertTrue(any(e["type"] == "tool_rejected" for e in result["events"]))
 
+    def test_invalid_json_recoverable_but_workflow_not_retried(self) -> None:
+        """Verify invalid json recoverable but workflow not retried."""
+        result = solve(self.task, self.path, "single", FakeClient(["oops", submit("SELECT 1")]))
+        self.assertEqual(result["stop_reason"], "submitted")
+        result = solve(self.task, self.path, "workflow", FakeClient(["oops"]))
+        self.assertEqual(result["stop_reason"], "protocol_error")
+        self.assertEqual(result["llm_calls"], 1)
 
+    def test_unknown_usage_halts_not_zero(self) -> None:
+        """Verify unknown usage halts not zero."""
+        result = solve(self.task, self.path, "single", FakeClient([submit("SELECT 1")], usage={}))
+        self.assertEqual(result["stop_reason"], "usage_missing")
+        self.assertIsNone(result["usage"]["total_tokens"])
+        self.assertEqual(result["tool_calls"], 0)
 
+    def test_transport_unknown_no_retry(self) -> None:
+        """Verify transport unknown no retry."""
+        result = solve(self.task, self.path, "single", FakeClient([ClientError("lost")]))
+        self.assertEqual(result["llm_calls"], 1)
+        self.assertFalse(result["usage_complete"])
+        self.assertEqual(result["stop_reason"], "transport_error_usage_unknown")
 
+    def test_token_budget_preflight(self) -> None:
+        """Verify token budget preflight."""
+        result = solve(self.task, self.path, "single", FakeClient([]), Budget(max_total_tokens=10))
+        self.assertEqual(result["llm_calls"], 0)
+        self.assertEqual(result["stop_reason"], "token_budget")
+        client = FakeClient([submit("SELECT 1")], usage={"prompt_tokens": 10, "completion_tokens": 15})
+        result = solve(self.task, self.path, "single", client, Budget(max_total_tokens=25))
+        self.assertEqual(client.request_caps, [15])
+        self.assertEqual(result["usage"]["total_tokens"], 25)
 
+    def test_token_mismatch_halts(self) -> None:
+        """Verify token mismatch halts."""
+        result = solve(self.task, self.path, "single", FakeClient([submit("SELECT 1")], usage={"prompt_tokens": 11, "completion_tokens": 10}))
+        self.assertEqual(result["stop_reason"], "tokenizer_mismatch")
+        self.assertEqual(result["tool_calls"], 0)
 
+    def test_token_overrun_reported(self) -> None:
+        """Verify token overrun reported."""
+        result = solve(self.task, self.path, "single", FakeClient([submit("SELECT 1")]), Budget(max_total_tokens=25))
+        self.assertTrue(result["token_budget_overrun"])
+        self.assertEqual(result["stop_reason"], "token_budget_overrun")
 
     def test_truncated_content_not_submitted(self) -> None:
         """Verify truncated content not submitted."""
@@ -168,6 +243,11 @@ class RuntimeTests(DatabaseCase):
         with self.assertRaises(ValueError):
             validate_tasks([{**self.task, "SQL": "SELECT secret"}])
 
+    def test_protocol_strict(self) -> None:
+        """Verify protocol strict."""
+        for value in ['{"action":"submit_sql","sql":"SELECT 1","sql":"SELECT 2"}', '```json\n{}\n```', 'null', '{"action":"shell","sql":"SELECT 1"}']:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_action(value, "single")
 
 
 class MetricTests(unittest.TestCase):
@@ -283,6 +363,11 @@ class MoreRegressionTests(DatabaseCase):
         result = preview({"status": "error", "error": "\\\"\n" * 50000}, SQLLimits(preview_chars=256))
         self.assertLessEqual(len(json.dumps(result, ensure_ascii=False)), 256)
 
+    def test_server_output_cap_violation(self) -> None:
+        """Verify server output cap violation."""
+        result = solve(self.task, self.path, "single", FakeClient([submit("SELECT 1")]), Budget(max_output_tokens=1))
+        self.assertEqual(result["stop_reason"], "server_output_cap_violation")
+        self.assertEqual(result["tool_calls"], 0)
 
     def test_invalid_budget_types(self) -> None:
         """Verify invalid budget types."""
