@@ -1,0 +1,28 @@
+{
+  "model": "gpt-oss-120b",
+  "base_url": "http://localhost:8000/v1",
+  "temperature": 0,
+  "seed": 42,
+  "http_timeout_s": 180,
+  "extra_body": {},
+  "token_accounting": {
+    "mode": "usage",
+    "prompt_margin_tokens": 512
+  },
+  "budget": {
+    "max_llm_calls": 8,
+    "max_tool_calls": 8,
+    "max_total_tokens": 32000,
+    "max_output_tokens": 4096,
+    "max_context_tokens": 32768,
+    "max_episode_s": 300
+  },
+  "sql_limits": {
+    "timeout_s": 15,
+    "max_rows": 100000,
+    "max_bytes": 8000000,
+    "memory_mb": 512,
+    "preview_rows": 20,
+    "preview_chars": 12000
+  }
+}
