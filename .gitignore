@@ -9,3 +9,16 @@ build/
 dist/
 local_data/
 runs/
+
+# Local experiment exports, databases, and patch delivery bundles
+*.zip
+*.patch
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-wal
+*.sqlite-shm
+configs/*.local.json
+.env.*
+!.env.example
+commit-delivery/
