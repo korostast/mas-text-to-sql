@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mas-sql-course"
-version = "0.1.4.dev0"
+version = "0.1.4"
 description = "Reproducible workflow and single-agent BIRD SQLite baselines"
 requires-python = ">=3.11"
 dependencies = []

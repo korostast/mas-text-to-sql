@@ -145,7 +145,7 @@ def main() -> None:
     p.add_argument("--tasks", required=True)
     p.add_argument("--db-root", required=True)
     p.add_argument("--config", required=True)
-    p.add_argument("--architecture", choices=["workflow"], required=True)
+    p.add_argument("--architecture", choices=["workflow", "single"], required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--repeat", type=int, default=0)
     p = commands.add_parser("evaluate", help="Offline ID-joined evaluation; gold is allowed here only")

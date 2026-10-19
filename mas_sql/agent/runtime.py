@@ -29,8 +29,8 @@ class EpisodeRunner:
                  client: ModelClient, budget: Budget, limits: SQLLimits,
                  accounting: TokenAccounting, emit: EventSink | None = None) -> None:
         """Set up an isolated task with shared schema and no gold access."""
-        if architecture != "workflow":
-            raise ValueError("Only workflow is integrated in this stage")
+        if architecture not in ("workflow", "single"):
+            raise ValueError("Architecture must be workflow or single")
         self.task = task
         self.path = path
         self.architecture = architecture
@@ -41,7 +41,7 @@ class EpisodeRunner:
         self.started: float = time.perf_counter()
         self.deadline: float = self.started + budget.max_episode_s
         self.generation = GenerationController(client, budget, accounting, self.log,
-                                               1)
+                                               1 if architecture == "workflow" else budget.max_llm_calls)
         self.investigation = InvestigationTracker(bool(task.get("evidence", "")))
         self.messages: list[Message] = initial_messages(task, schema(path), architecture)
         self.tool_calls: int = 0
@@ -58,9 +58,12 @@ class EpisodeRunner:
         return max(0.0, self.deadline - time.perf_counter())
 
     def _protocol_error(self, error: str) -> None:
-        """Record an invalid one-shot response without retrying the model."""
+        """Return validation feedback without executing or accepting model SQL."""
         self.log.add("protocol_error", error=error)
-        self.stop_reason = self.generation.stop_reason or "protocol_error"
+        if self.generation.stop_reason or self.architecture == "workflow":
+            self.stop_reason = self.generation.stop_reason or "protocol_error"
+        else:
+            self.messages.append({"role": "user", "content": f"Protocol error: {error}. Return one valid action JSON object."})
 
     def _read_action(self, response: ChatResponse) -> Action | None:
         """Validate a complete action and freeze the unassisted first candidate."""
@@ -83,7 +86,20 @@ class EpisodeRunner:
             return None
         return action
 
+    def _remaining_budget(self) -> dict[str, int | float]:
+        """Report remaining resources without representing estimates as usage."""
+        return {"llm_calls": self.generation.call_cap - self.generation.calls,
+                "tool_calls": self.budget.max_tool_calls - self.tool_calls,
+                "total_tokens": self.budget.max_total_tokens - self.generation.ledger.total_tokens,
+                "episode_s": self.remaining_s()}
 
+    def _feedback(self, action: Action, observation: dict[str, Any], accepted: bool = False) -> None:
+        """Associate visible feedback with the exact action and observation ID."""
+        payload: dict[str, Any] = {"tool": action.name, "observation_id": self.tool_calls,
+                                   "result": observation, "remaining": self._remaining_budget()}
+        if action.name == "submit_sql":
+            payload.update(accepted=accepted, instruction="Submission failed execution and was NOT accepted. Use the error to repair or diagnose within the remaining budget; submit again when ready.")
+        self.messages.append({"role": "user", "content": json.dumps(payload, ensure_ascii=False)})
 
     def _execute(self, action: Action) -> None:
         """Execute one guarded SQL action and track its candidate/check provenance."""
@@ -104,21 +120,34 @@ class EpisodeRunner:
                      sql_fingerprint=sql_fingerprint(action.sql))
         if action.name == "submit_sql":
             self._submission(action, result, observation)
+        else:
+            self._feedback(action, observation)
 
     def _submission(self, action: Action, result: dict[str, Any], observation: dict[str, Any]) -> None:
-        """Finish the baseline after its single execution, even on SQL error."""
+        """Accept executable SQL or give single-agent failures another bounded turn."""
         self.last_submission = {"sql": action.sql, "observation_id": self.tool_calls,
                                 "result": observation if result["status"] == "ok" else result}
-        self.final_sql, self.final_result = action.sql, result
-        self.stop_reason = "submitted" if result["status"] == "ok" else "submitted_execution_failed"
+        if result["status"] == "ok" or self.architecture == "workflow":
+            self.final_sql, self.final_result = action.sql, result
+            self.stop_reason = "submitted" if result["status"] == "ok" else "submitted_execution_failed"
+            return
+        self.log.add("submission_rejected", sql=action.sql, observation_id=self.tool_calls,
+                     status=result["status"], reason="execution_failed", remaining=self._remaining_budget())
+        self._feedback(action, observation)
+        if self.tool_calls >= self.budget.max_tool_calls:
+            self.stop_reason = "tool_call_budget"
 
     def _dispatch(self, action: Action) -> None:
-        """Execute the sole answer within the shared time and SQL budgets."""
+        """Preserve a final execution slot without forcing diagnostic work."""
         if self.remaining_s() <= 1.0:
             self.stop_reason = "episode_time_budget"
             return
         if self.tool_calls >= self.budget.max_tool_calls:
             self.stop_reason = "tool_call_budget"
+            return
+        if action.name == "execute_sql" and self.tool_calls >= self.budget.max_tool_calls - 1:
+            self.log.add("tool_rejected", action=action.payload(), reason="Reserve last slot for submit_sql")
+            self.messages.append({"role": "user", "content": "Tool budget: only one call remains, reserved for submit_sql. Submit your final answer now."})
             return
         self._execute(action)
 
