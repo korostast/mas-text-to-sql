@@ -3,13 +3,37 @@ from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
-from mas_sql.evaluation.behavior import investigation_summary
+from mas_sql.evaluation.behavior import investigation_summary, team_summary
+from mas_sql.agent.investigation import sql_fingerprint
 from mas_sql.data.io import digest, read_json, write_json
 from mas_sql.database.paths import db_path
 from mas_sql.data.dataset import validate_tasks
 from mas_sql.data.manifest import verify_manifest
 from mas_sql.evaluation.metrics import ex_bird, filtered_mean, rv_reward, soft_f1_bird
 from mas_sql.database.executor import SQLLimits, execute
+
+
+
+def score_team_reviews(team: dict[str, Any], path: str | Path, truth_rows: list[Any],
+                       limits: SQLLimits) -> list[dict[str, Any]]:
+    """Label reviewed versions offline without exposing gold to the runtime."""
+    candidates: dict[int, dict[str, Any]] = {candidate["version"]: candidate for candidate in team["candidates"]}
+    if len(candidates) != len(team["candidates"]):
+        raise ValueError("Duplicate team candidate version")
+    cache: dict[int, dict[str, Any]] = {}
+    outcomes: list[dict[str, Any]] = []
+    for review in team["reviews"]:
+        candidate: dict[str, Any] = candidates[review["candidate_version"]]
+        if not candidate["sql_fingerprint"] == review["sql_fingerprint"] == sql_fingerprint(candidate["sql"]):
+            raise ValueError("Review/candidate fingerprint mismatch")
+        version: int = candidate["version"]
+        if version not in cache:
+            result: dict[str, Any] = execute(path, candidate["sql"], limits)
+            cache[version] = {"status": result["status"],
+                              "EX": ex_bird(result["rows"], truth_rows) if result["status"] == "ok" else 0}
+        outcomes.append({"review_id": review["id"], "candidate_version": version,
+                         "verdict": review["verdict"], **cache[version]})
+    return outcomes
 
 
 def evaluate(tasks_path: str | Path, gold_path: str | Path, run_path: str | Path,
@@ -51,6 +75,9 @@ def evaluate(tasks_path: str | Path, gold_path: str | Path, run_path: str | Path
             row[f"EX_{stage}"] = ex_bird(result["rows"], truth["rows"]) if result["status"] == "ok" else 0
             row[f"SoftF1_BIRD_{stage}"] = soft_f1_bird(result["rows"], truth["rows"]) if result["status"] == "ok" else 0.0
         row["investigation"] = pred[ident].get("investigation")
+        if pred[ident].get("team") is not None:
+            row["team"] = pred[ident]["team"]
+            row["review_outcomes"] = score_team_reviews(row["team"], path, truth["rows"], limits)
         row["R_VES_safe_v1"] = None
         row["rves_status"] = "disabled"
         if rves_repeats:
@@ -88,7 +115,10 @@ def evaluate(tasks_path: str | Path, gold_path: str | Path, run_path: str | Path
               "sql_limits": asdict(limits), "rves_repeats": rves_repeats,
               "summary": aggregate(details),
               "investigation_quality": investigation_summary(details, scored=True),
-              "protocol_version": run_meta.get("protocol_version"), "prompt_version": run_meta.get("prompt_version"), "by_difficulty": {
+              "team_quality": team_summary(details, scored=True),
+              "protocol_version": run_meta.get("protocol_version"), "prompt_version": run_meta.get("prompt_version"),
+              **({"closure_version": run_meta["closure_version"]} if "closure_version" in run_meta else {}),
+              **({"context_version": run_meta["context_version"]} if "context_version" in run_meta else {}), "by_difficulty": {
                   d: aggregate([r for r in details if r["difficulty"] == d]) for d in sorted({r["difficulty"] for r in details})},
               "stop_reasons": dict(Counter(r["stop_reason"] for r in details)), "rows": details}
     write_json(output, report)

@@ -12,12 +12,15 @@ from typing import Any
 from mas_sql import __version__
 from mas_sql.agent.prompts import PROMPT_VERSION
 from mas_sql.agent.runtime import PROTOCOL_VERSION, Budget, solve
+from mas_sql.agent.sequential.prompts import (CONTEXT_VERSION as SEQUENTIAL_CONTEXT,
+    PROTOCOL_VERSION as SEQUENTIAL_PROTOCOL, PROMPT_VERSION as SEQUENTIAL_PROMPT)
+from mas_sql.agent.sequential.closure import CLOSURE_VERSION as SEQUENTIAL_CLOSURE
 from mas_sql.data.dataset import prepare, validate_tasks
 from mas_sql.data.io import digest, read_json, write_json
 from mas_sql.data.manifest import verify_manifest
 from mas_sql.database.executor import SQLLimits
 from mas_sql.database.paths import db_path
-from mas_sql.evaluation.behavior import investigation_summary
+from mas_sql.evaluation.behavior import investigation_summary, team_summary
 from mas_sql.evaluation.evaluator import evaluate
 from mas_sql.llm.accounting import TokenAccounting
 from mas_sql.llm.client import ChatClient, ClientError, usage_counts
@@ -64,12 +67,16 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("Run output must be empty; no implicit resume or overwrite")
     out.mkdir(parents=True, exist_ok=True)
     (out / "episodes").mkdir()
+    protocol_version: str = SEQUENTIAL_PROTOCOL if args.architecture == "sequential" else PROTOCOL_VERSION
+    prompt_version: str = SEQUENTIAL_PROMPT if args.architecture == "sequential" else PROMPT_VERSION
+    context_meta: dict[str, str] = ({"context_version": SEQUENTIAL_CONTEXT, "closure_version": SEQUENTIAL_CLOSURE}
+                                    if args.architecture == "sequential" else {})
     effective = {**config, "base_url": client.base_url, "model": client.model, "tokenize_url": client.tokenize_url,
                  "token_accounting": asdict(accounting)}
     write_json(out / "run.json", {"version": __version__, "source_sha256": source_hash(),
         "python": sys.version, "platform": platform.platform(), "sqlite": sqlite3.sqlite_version,
         "architecture": args.architecture, "repeat": args.repeat, "config": effective,
-        "protocol_version": PROTOCOL_VERSION, "prompt_version": PROMPT_VERSION,
+        "protocol_version": protocol_version, "prompt_version": prompt_version, **context_meta,
         "tasks_sha256": digest(args.tasks), "manifest_sha256": manifest_hash})
     results: list[dict[str, Any]] = []
     for index, task in enumerate(tasks):
@@ -78,7 +85,7 @@ def run(args: argparse.Namespace) -> None:
         with open(str(prefix) + ".events.jsonl", "w", encoding="utf-8") as trace:
             def emit(event: dict[str, Any]) -> None:
                 """Persist each event before the next runtime step."""
-                trace.write(json.dumps({"id": task["id"], **event}, ensure_ascii=False) + "\n")
+                trace.write(json.dumps({**event, "id": task["id"]}, ensure_ascii=False) + "\n")
                 trace.flush()
                 os.fsync(trace.fileno())
             result = solve(task, db_path(args.db_root, task["db_id"]), args.architecture,
@@ -92,8 +99,9 @@ def run(args: argparse.Namespace) -> None:
     # Legacy-compatible values keyed by ORIGINAL IDs; no positional fallback.
     write_json(out / "predict_bird.json", {r["id"]: f"{r['final_sql']}\t----- bird -----\t{r['db_id']}" if r["final_sql"] else None for r in results})
     write_json(out / "resource_summary.json", {
-        "protocol_version": PROTOCOL_VERSION, "prompt_version": PROMPT_VERSION,
+        "protocol_version": protocol_version, "prompt_version": prompt_version, **context_meta,
         "investigation": investigation_summary(results),
+        "team": team_summary(results),
         "token_accounting": asdict(accounting),
         "tokenizer_mismatch_count": sum(r["tokenizer_mismatch_count"] for r in results),
         "token_budget_overrun_episodes": sum(r["token_budget_overrun"] for r in results),
@@ -130,7 +138,7 @@ def probe(args: argparse.Namespace) -> None:
 
 def main() -> None:
     """Parse CLI arguments and dispatch one project operation."""
-    parser = argparse.ArgumentParser(description="BIRD workflow / single-agent experiment harness")
+    parser = argparse.ArgumentParser(description="BIRD workflow / single-agent / sequential MAS harness")
     commands = parser.add_subparsers(dest="command", required=True)
     p = commands.add_parser("prepare", help="Create frozen 50 eval + 10 pilot splits")
     p.add_argument("--dataset", required=True)
@@ -145,7 +153,7 @@ def main() -> None:
     p.add_argument("--tasks", required=True)
     p.add_argument("--db-root", required=True)
     p.add_argument("--config", required=True)
-    p.add_argument("--architecture", choices=["workflow", "single"], required=True)
+    p.add_argument("--architecture", choices=["workflow", "single", "sequential"], required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--repeat", type=int, default=0)
     p = commands.add_parser("evaluate", help="Offline ID-joined evaluation; gold is allowed here only")

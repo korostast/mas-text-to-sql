@@ -1,7 +1,9 @@
 # MAS Text-to-SQL
 
 Проект на базе BIRD mini-dev. Интегрированы подготовка данных, read-only SQLite, EX / SoftF1 / R_VES_safe_v1,
-workflow и single-agent. Author–Critic добавляется следующим коммитом.
+workflow, single-agent и последовательная MAS Author–Critic. Текущий runtime — v0.1.8.
+Контракт ролей — в SEQUENTIAL_PROTOCOL.md; ограничения экспериментальной воспроизводимости
+будут зафиксированы отдельным документом, не историей Git.
 
 Python 3.11+, Linux/WSL. Новый harness использует только стандартную библиотеку.
 `requirements.txt` относится к legacy BIRD-скриптам, не к mas_sql.
