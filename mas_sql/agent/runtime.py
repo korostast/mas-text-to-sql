@@ -10,6 +10,7 @@ from mas_sql.agent.events import EventLog, EventSink
 from mas_sql.agent.generation import GenerationController
 from mas_sql.agent.investigation import InvestigationTracker, sql_fingerprint
 from mas_sql.agent.prompts import PROMPT_VERSION, initial_messages
+from mas_sql.agent.sequential.runtime import SequentialEpisodeRunner
 from mas_sql.database.executor import SQLLimits, execute, preview, schema
 from mas_sql.llm.accounting import TokenAccounting
 from mas_sql.llm.types import ChatResponse, Message, ModelClient
@@ -188,5 +189,8 @@ def solve(task: Mapping[str, str], path: str | Path, architecture: str,
           client: ModelClient, budget: Budget | None = None, limits: SQLLimits | None = None,
           emit: EventSink | None = None, accounting: TokenAccounting | None = None) -> dict[str, Any]:
     """Solve one task with a fresh runner and no cross-task model history."""
+    if architecture == "sequential":
+        return SequentialEpisodeRunner(task, path, client, budget or Budget(), limits or SQLLimits(),
+                                       accounting or TokenAccounting(), emit).run()
     return EpisodeRunner(task, path, architecture, client, budget or Budget(), limits or SQLLimits(),
                          accounting or TokenAccounting(), emit).run()

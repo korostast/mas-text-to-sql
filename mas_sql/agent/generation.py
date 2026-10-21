@@ -112,7 +112,30 @@ class GenerationController:
             self.stop_reason = "server_output_cap_violation"
         return counts, mismatch
 
-    def request(self, messages: list[Message], remaining: Callable[[], float]) -> ChatResponse | None:
+    def request(self, messages: list[Message], remaining: Callable[[], float],
+                context: dict[str, Any] | None = None, *, holdback_tokens: int = 0,
+                min_output_tokens: int = 1) -> ChatResponse | None:
+        """Tag all events of one shared call while preserving accounting semantics."""
+        if (isinstance(holdback_tokens, bool) or not isinstance(holdback_tokens, int) or holdback_tokens < 0
+                or isinstance(min_output_tokens, bool) or not isinstance(min_output_tokens, int) or min_output_tokens < 1):
+            raise ValueError("Reservations need nonnegative integer holdback and positive integer output floor")
+        with self.log.scoped(context):
+            return self._request(messages, remaining, holdback_tokens, min_output_tokens)
+
+    def projected_reserve(self, messages: list[Message], remaining: Callable[[], float], role: str) -> int | None:
+        """Measure a planning snapshot, never a generation or a ledger charge."""
+        if remaining() <= 0:
+            self.stop_reason = "episode_time_budget"
+            return None
+        count: int | None = self._count(messages, remaining)
+        if count is None:
+            return None
+        reserve: int = self.accounting.reserve(count)
+        self.log.add("budget_projection", projected_role=role, prompt_tokens=count, reserved_prompt_tokens=reserve)
+        return reserve
+
+    def _request(self, messages: list[Message], remaining: Callable[[], float],
+                 holdback_tokens: int = 0, min_output_tokens: int = 1) -> ChatResponse | None:
         """Request one completion without retries or approximate usage charges."""
         if self.calls >= self.call_cap:
             self.stop_reason = "llm_call_budget"
@@ -125,10 +148,15 @@ class GenerationController:
             return None
         reserve: int = self.accounting.reserve(preflight)
         output_cap: int = min(self.budget.max_output_tokens,
-                              self.budget.max_total_tokens - self.ledger.total_tokens - reserve,
+                              self.budget.max_total_tokens - self.ledger.total_tokens - reserve - holdback_tokens,
                               self.budget.max_context_tokens - reserve)
         self.log.add("preflight", prompt_tokens=preflight, reserved_prompt_tokens=reserve,
-                     output_cap=output_cap, accounting_mode=self.accounting.mode)
+                     output_cap=output_cap, accounting_mode=self.accounting.mode,
+                     **({"holdback_tokens": holdback_tokens, "min_output_tokens": min_output_tokens}
+                        if holdback_tokens or min_output_tokens > 1 else {}))
+        if (holdback_tokens or min_output_tokens > 1) and output_cap < min_output_tokens:
+            self.stop_reason = "insufficient_closure_budget"
+            return None
         if output_cap <= 0:
             self.stop_reason = "token_budget" if self.budget.max_total_tokens - self.ledger.total_tokens <= reserve else "context_budget"
             return None

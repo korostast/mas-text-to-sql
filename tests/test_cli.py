@@ -20,6 +20,7 @@ class MockHTTP(BaseHTTPRequestHandler):
     system_delta: ClassVar[int] = 0
     simulate_recovery: ClassVar[bool] = False
     malformed_content: ClassVar[bool] = False
+    simulate_sequential_repair: ClassVar[bool] = False
 
     def log_message(self, format: str, *args: object) -> None:
         """Suppress HTTP noise during the test run."""
@@ -35,6 +36,28 @@ class MockHTTP(BaseHTTPRequestHandler):
             action: dict[str, Any]
             if body["messages"][-1]["content"].startswith("Return exactly this JSON"):
                 action = {"ok": True}
+            elif any("You are SQL Author." in m["content"] or "You are SQL Critic." in m["content"]
+                     for m in body["messages"] if m["role"] == "system"):
+                packet: dict[str, Any] = json.loads(body["messages"][-1]["content"])
+                current: dict[str, Any] | None = packet["current_candidate"]
+                if current is None:
+                    action = {"action": "execute_sql", "purpose": "candidate",
+                              "sql": "SELECT missing_column FROM people" if self.simulate_sequential_repair else "SELECT name FROM people"}
+                elif packet["active_role"] == "critic":
+                    bad: bool = "missing_column" in current["sql"]
+                    action = {"action": "review_sql", "candidate_version": current["version"],
+                              "sql_fingerprint": current["sql_fingerprint"], "verdict": "request_changes" if bad else "approve",
+                              "issues": [{"id": "I1", "category": "execution", "message": "Missing column; check DDL",
+                                          "sources": ["schema", "observation:1"], "basis": "execution",
+                                          "grounds": [{"source": "observation:1", "quote": "missing_column"}]}] if bad else []}
+                elif "missing_column" in current["sql"]:
+                    action = {"action": "execute_sql", "purpose": "candidate", "sql": "SELECT name FROM people",
+                              "revision": {"reason": "Use the actual column from schema and error",
+                                           "sources": ["schema", "observation:1", "review:1"], "basis": "execution",
+                                           "grounds": [{"source": "observation:1", "quote": "missing_column"}]}}
+                else:
+                    action = {"action": "submit_sql", "candidate_version": current["version"],
+                              "sql_fingerprint": current["sql_fingerprint"]}
             elif self.simulate_recovery and len(body["messages"]) == 2:
                 action = {"action": "submit_sql", "sql": "SELECT missing_column FROM people"}
             elif self.simulate_recovery:
@@ -84,12 +107,34 @@ class CLITest(unittest.TestCase):
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                 cli("prepare", "--dataset", root / "dataset.json", "--db-root", root, "--out", root / "split")
                 cli("probe", "--config", root / "config.json", "--out", root / "probe.json")
-                for arch in ["workflow", "single"]:
+                for arch in ["workflow", "single", "sequential"]:
                     cli("run", "--architecture", arch, "--config", root / "config.json", "--tasks", root / "split/pilot.tasks.json", "--db-root", root, "--out", root / arch)
                     cli("evaluate", "--tasks", root / "split/pilot.tasks.json", "--gold", root / "split/pilot.gold.json", "--run", root / arch, "--db-root", root, "--out", root / f"{arch}.report.json", "--rves-repeats", "2")
                     self.assertEqual(read_json(root / f"{arch}.report.json")["summary"]["EX_final"], 1)
                     self.assertEqual(len(read_json(root / arch / "results.json")), 10)
-                    self.assertEqual(read_json(root / arch / "resource_summary.json")["known_tokens"], 300)
+                    metadata = read_json(root / arch / "run.json")
+                    if arch == "sequential":
+                        self.assertEqual(metadata["context_version"], "public-snapshot-v2")
+                        self.assertEqual(metadata["closure_version"], "closure-reserve-v2")
+                        self.assertEqual(read_json(root / arch / "resource_summary.json")["closure_version"], "closure-reserve-v2")
+                        self.assertEqual(read_json(root / f"{arch}.report.json")["closure_version"], "closure-reserve-v2")
+                        self.assertEqual(read_json(root / arch / "resource_summary.json")["context_version"], "public-snapshot-v2")
+                        self.assertEqual(read_json(root / f"{arch}.report.json")["context_version"], "public-snapshot-v2")
+                        review_events: int = 0
+                        for episode_file in (root / arch / "episodes").glob("*.json"):
+                            episode = read_json(episode_file)
+                            self.assertEqual(episode["context_version"], "public-snapshot-v2")
+                            self.assertEqual(episode["closure_version"], "closure-reserve-v2")
+                            for line in episode_file.with_suffix(".events.jsonl").read_text().splitlines():
+                                event = json.loads(line)
+                                self.assertEqual(event["id"], episode["id"])
+                                if event["type"] == "critic_review":
+                                    review_events += 1
+                                    self.assertEqual(event["review_id"], "review:1")
+                        self.assertEqual(review_events, 10)
+                    else:
+                        self.assertNotIn("context_version", metadata)
+                    self.assertEqual(read_json(root / arch / "resource_summary.json")["known_tokens"], 900 if arch == "sequential" else 300)
                 # Same HTTP endpoints, but generation now renders system messages differently.
                 MockHTTP.system_delta = 7
                 failed = subprocess.run([sys.executable, "-m", "mas_sql", "probe", "--config", str(root / "config.json"),
@@ -101,13 +146,13 @@ class CLITest(unittest.TestCase):
                 config["token_accounting"] = {"mode": "usage", "prompt_margin_tokens": 512}
                 write_json(root / "usage_config.json", config)
                 cli("probe", "--config", root / "usage_config.json", "--out", root / "usage_probe.json")
-                for arch in ["workflow", "single"]:
+                for arch in ["workflow", "single", "sequential"]:
                     output = root / (arch + "_usage")
                     cli("run", "--architecture", arch, "--config", root / "usage_config.json", "--tasks", root / "split/pilot.tasks.json", "--db-root", root, "--out", output)
                     self.assertTrue(all(r["stop_reason"] == "submitted" for r in read_json(output / "results.json")))
                     summary = read_json(output / "resource_summary.json")
-                    self.assertEqual(summary["known_tokens"], 370)
-                    self.assertEqual(summary["tokenizer_mismatch_count"], 10)
+                    self.assertEqual(summary["known_tokens"], 1110 if arch == "sequential" else 370)
+                    self.assertEqual(summary["tokenizer_mismatch_count"], 30 if arch == "sequential" else 10)
                 MockHTTP.simulate_recovery = True
                 recovery = root / "single_recovery"
                 cli("run", "--architecture", "single", "--config", root / "usage_config.json", "--tasks", root / "split/pilot.tasks.json", "--db-root", root, "--out", recovery)
@@ -123,6 +168,22 @@ class CLITest(unittest.TestCase):
                 resources = read_json(recovery / "resource_summary.json")
                 self.assertEqual(resources["known_tokens"], 740)
                 self.assertEqual(resources["investigation"]["failed_submissions"], 10)
+                MockHTTP.simulate_recovery = False
+                MockHTTP.simulate_sequential_repair = True
+                team_recovery = root / "sequential_recovery"
+                cli("run", "--architecture", "sequential", "--config", root / "usage_config.json", "--tasks", root / "split/pilot.tasks.json", "--db-root", root, "--out", team_recovery)
+                cli("evaluate", "--tasks", root / "split/pilot.tasks.json", "--gold", root / "split/pilot.gold.json", "--run", team_recovery, "--db-root", root, "--out", team_recovery / "evaluation.json")
+                team_report = read_json(team_recovery / "evaluation.json")
+                self.assertEqual(team_report["summary"]["EX_first"], 0)
+                self.assertEqual(team_report["summary"]["EX_final"], 1)
+                self.assertEqual(team_report["summary"]["repairs"], 10)
+                self.assertEqual(team_report["team_quality"]["scored_reviews"], 20)
+                resources = read_json(team_recovery / "resource_summary.json")
+                self.assertEqual(resources["known_tokens"], 1850)
+                self.assertEqual(resources["team"]["llm_calls_by_role"], {"author": 30, "critic": 20})
+                self.assertEqual(resources["protocol_version"], "sequential-author-critic-v2")
+                self.assertEqual(read_json(team_recovery / "run.json")["prompt_version"], "sequential-action-contract-v3")
+                MockHTTP.simulate_sequential_repair = False
                 # A malformed envelope still carries real usage through the whole CLI.
                 MockHTTP.malformed_content = True
                 malformed_probe = root / "malformed_probe.json"
@@ -133,7 +194,7 @@ class CLITest(unittest.TestCase):
                 self.assertEqual(case["error_kind"], "response_format")
                 self.assertEqual(case["diagnostics"]["http_status"], 200)
                 self.assertTrue(case["usage_complete"])
-                for arch in ["workflow", "single"]:
+                for arch in ["workflow", "single", "sequential"]:
                     malformed = root / (arch + "_malformed")
                     cli("run", "--architecture", arch, "--config", root / "usage_config.json", "--tasks", root / "split/pilot.tasks.json",
                         "--db-root", root, "--out", malformed)
@@ -147,7 +208,7 @@ class CLITest(unittest.TestCase):
                     self.assertTrue(summary["usage_complete"])
                     self.assertEqual(summary["unknown_usage_episodes"], 0)
                     self.assertEqual(summary["llm_calls"], 10)
-                    self.assertEqual(summary["prompt_version"], "action-contract-v2")
+                    self.assertEqual(summary["prompt_version"], "sequential-action-contract-v3" if arch == "sequential" else "action-contract-v2")
                     self.assertEqual(read_json(malformed / "evaluation.json")["summary"]["EX_final"], 0)
                 self.assertNotIn("HIDDEN_GOLD", json.dumps(MockHTTP.requests))
                 self.assertTrue(all("max_tokens" in b for p, b in MockHTTP.requests if p.endswith("chat/completions")))
@@ -155,6 +216,7 @@ class CLITest(unittest.TestCase):
                 MockHTTP.system_delta = 0
                 MockHTTP.simulate_recovery = False
                 MockHTTP.malformed_content = False
+                MockHTTP.simulate_sequential_repair = False
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
